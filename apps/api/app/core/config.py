@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     AMAZON_ACCESS_KEY: Optional[str] = None
     AMAZON_SECRET_KEY: Optional[str] = None
 
+    # SerpAPI — Real Amazon India product search (immediate, no Associates needed)
+    # Sign up: https://serpapi.com | Free: 100 searches/month
+    SERPAPI_KEY: Optional[str] = None
+
     # Google OAuth
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
