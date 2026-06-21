@@ -58,3 +58,4 @@ htmlcov/
 
 # Test files
 apps/api/test_flow.py
+videos/
