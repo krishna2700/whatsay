@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     AMAZON_AFFILIATE_TAG: str = "whatsay-21"
     AMAZON_BASE_URL: str = "https://www.amazon.in"
 
+    # Amazon PA-API (Product Advertising API) — get from Amazon Associates
+    # https://affiliate-program.amazon.in/ → Tools → Product Advertising API
+    AMAZON_ACCESS_KEY: Optional[str] = None
+    AMAZON_SECRET_KEY: Optional[str] = None
+
     # Google OAuth
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None

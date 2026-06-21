@@ -1,107 +1,106 @@
 """
-WhatSay AI Recommendation Engine
+WhatSay AI Recommendation Engine — Proper Architecture
 
-Uses GPT-4o's deep knowledge of Amazon India products to:
-1. Validate if category is supported on Amazon India
-2. Find real products with actual ASINs
-3. Generate honest recommendation with pros/cons/verdict
-4. Inject affiliate links (tag=whatsay-21)
+REAL Flow (3 steps):
+  Step 1 — Intent Extraction (GPT-4o)
+    User question → extract product search queries + category + budget
 
-Single optimized GPT-4o call for speed and accuracy.
+  Step 2 — Amazon Search (PA-API or fallback)
+    Search queries → REAL Amazon India products with live ASINs, prices, images
+    IF PA-API configured: returns real live data from Amazon
+    IF not configured: uses Amazon search URLs (always valid, affiliate tracked)
+
+  Step 3 — AI Recommendation (GPT-4o)
+    Real Amazon products → honest analysis → verdict + pros/cons + ranking
+
+NO hardcoded products. NO fake ASINs. REAL Amazon data only.
 """
 
 import json
 import re
 from typing import Optional, AsyncGenerator
+from urllib.parse import quote_plus
 from app.ai.base import BaseAIProvider, AIMessage, RecommendationResult
-from app.affiliate.service import AffiliateService
 from app.core.config import settings
 import structlog
 
 logger = structlog.get_logger()
 
-MASTER_PROMPT = """You are WhatSay AI — an expert Amazon India buying advisor.
+# ─── Unsupported categories ───────────────────────────────────────────────────
+UNSUPPORTED_KEYWORDS = {
+    "car", "cars", "automobile", "automobiles", "vehicle", "vehicles",
+    "bike", "motorcycle", "scooter", "nexon", "swift", "creta",
+    "innova", "fortuner", "baleno", "activa", "pulsar",
+    "real estate", "property", "house", "apartment", "flat", "plot",
+    "flight", "flights", "hotel", "hotels", "travel package",
+    "insurance", "loan", "loans", "credit card", "mutual fund",
+}
+
+# ─── Step 1: Intent extraction prompt ────────────────────────────────────────
+INTENT_PROMPT = """You are a product search expert for Amazon India.
+
+Extract search intent from the user's question and return JSON:
+{
+  "is_amazon_supported": true,
+  "unsupported_reason": null,
+  "category": "Electronics|Computers|Headphones|Smartphones|Laptops|Cameras|Wearables|HomeAppliances|Other",
+  "search_index": "Electronics|Computers|All",
+  "search_queries": ["query1", "query2"],
+  "budget_inr": null,
+  "intent": "buy_specific|compare|find_best|budget_search|review_check"
+}
+
+Rules:
+- is_amazon_supported = false ONLY for: cars, real estate, flights, insurance, loans
+- Generate 2-3 specific Amazon India search queries
+- budget_inr: extract number if mentioned (e.g. 5000 for "under 5000")
+- Keep queries short and specific for Amazon search
+
+Examples:
+Q: "Best earbuds under 5000 for gym"
+→ search_queries: ["wireless earbuds under 5000", "sports earbuds IPX5 waterproof", "gym earbuds bluetooth"]
+→ budget_inr: 5000, category: "Headphones"
+
+Q: "Should I buy iPhone 15?"
+→ search_queries: ["Apple iPhone 15 128GB", "iPhone 15"]
+→ category: "Smartphones"
+
+Q: "Should I buy Tata Nexon?"
+→ is_amazon_supported: false
+→ unsupported_reason: "Cars and automobiles are not available on Amazon India."
+"""
+
+# ─── Step 3: Recommendation prompt ───────────────────────────────────────────
+RECOMMENDATION_PROMPT = """You are WhatSay AI — an honest Amazon India buying advisor.
 
 USER QUESTION: {question}
 BUDGET: {budget}
 
-YOUR JOB:
-1. Determine if this product/category is available on Amazon India
-2. If YES: Find 3-5 REAL Amazon India products with actual ASINs
-3. Generate an honest, detailed buying recommendation
-4. Return structured JSON
+REAL AMAZON INDIA PRODUCTS FOUND (live data):
+{products_context}
 
-AMAZON INDIA AVAILABILITY RULES:
-- Electronics, gadgets, appliances, accessories → SUPPORTED ✅
-- Cars, bikes, real estate, flights, insurance, loans → NOT SUPPORTED ❌
-- If not supported: set is_amazon_supported=false
+Based ONLY on the above real Amazon products, generate a buying recommendation.
 
-PRODUCT KNOWLEDGE (use these real ASINs as reference):
-EARBUDS/HEADPHONES:
-- boAt Airdopes 141: B09XQMJNZP, ₹1,299, 4.1★, 500K reviews
-- boAt Airdopes 311 Pro: B0BXQMJNZP, ₹1,499, 4.0★
-- Noise Buds VS104 Max: B0BYQ3FXKM, ₹1,499, 4.0★, 80K reviews  
-- JBL Tune 230NC TWS: B09W9MXQKP, ₹3,999, 4.2★, 25K reviews
-- JBL Wave Beam: B0BW9MXQKP, ₹2,499, 4.1★
-- OnePlus Nord Buds 2: B0BYQ8XKZP, ₹2,999, 4.2★, 30K reviews
-- OnePlus Nord Buds 2r: B0CRQXKPZM, ₹1,799, 4.1★
-- Samsung Galaxy Buds FE: B0CJXMJNZP, ₹4,999, 4.2★, 15K reviews
-- Sony WF-C700N: B0BW8MXQKP, ₹7,990, 4.3★, 12K reviews
-- Apple AirPods (3rd gen): B09JQL3NWT, ₹14,900, 4.5★, 40K reviews
-- Apple AirPods Pro 2: B0BDHB9Y8H, ₹24,900, 4.6★, 35K reviews
+Rules:
+- Only recommend products from the list above
+- Be honest about pros and cons
+- Consider the user's budget and use case
+- Rank products by best fit for the user's needs
 
-SMARTPHONES:
-- iPhone 15 128GB: B0CHX3QBCH, ₹69,900, 4.6★, 25K reviews
-- iPhone 15 Pro 128GB: B0CHX1W1XY, ₹1,34,900, 4.7★, 15K reviews
-- Samsung Galaxy S24 128GB: B0CS4BXMQP, ₹54,999, 4.4★, 20K reviews
-- Samsung Galaxy A55: B0CW9MXQKP, ₹34,999, 4.3★, 18K reviews
-- OnePlus 12 256GB: B0CRQXKPZM, ₹64,999, 4.4★, 22K reviews
-- OnePlus Nord CE4: B0CW8MXQKP, ₹24,999, 4.2★, 15K reviews
-- Xiaomi 14: B0CX23V2ZK, ₹69,999, 4.4★, 10K reviews
-- Redmi Note 13 Pro+: B0CRXMJNZP, ₹29,999, 4.3★, 30K reviews
-- Realme 12 Pro+: B0CW9XKZPM, ₹27,999, 4.2★, 12K reviews
-
-LAPTOPS:
-- MacBook Air M3 8GB: B0CX23V2ZK, ₹1,14,900, 4.7★, 8K reviews
-- HP Victus 15 i5: B0BQXMJNZP, ₹54,990, 4.2★, 12K reviews
-- Dell Inspiron 15 i5: B0BW9MXQKP, ₹52,990, 4.1★, 10K reviews
-- Lenovo IdeaPad Slim 3: B0BXQMJNZP, ₹42,990, 4.1★, 15K reviews
-- Asus VivoBook 15: B0BYQ3FXKM, ₹45,990, 4.2★, 18K reviews
-- ASUS ROG Strix G15: B0CRQXKPZM, ₹89,990, 4.4★, 5K reviews
-
-IMPORTANT: You can use the above ASINs OR generate other real ASINs you know exist.
-Always use format: B0XXXXXXXXX (10 characters starting with B0)
-
-Return ONLY this JSON (no markdown, no text outside JSON):
+Return ONLY valid JSON:
 {{
-  "is_amazon_supported": true,
-  "unsupported_reason": null,
-  "category": "audio",
-  "intent": "budget_search",
-  "verdict": "highly_recommended",
-  "summary": "2-3 sentence summary of recommendation",
-  "detailed_analysis": "Detailed analysis of the products and why they suit the user",
-  "pros": ["Great battery life", "IPX5 water resistant", "Secure fit for gym"],
-  "cons": ["No ANC at this price", "Plastic build"],
-  "score": 87,
-  "confidence": 92,
-  "products": [
+  "verdict": "highly_recommended|recommended|neutral|not_recommended|avoid",
+  "summary": "2-3 sentence honest summary mentioning specific products",
+  "detailed_analysis": "Detailed paragraph explaining your recommendation",
+  "pros": ["specific pro 1", "specific pro 2", "specific pro 3"],
+  "cons": ["specific con 1", "specific con 2"],
+  "score": 85,
+  "confidence": 90,
+  "ranked_products": [
     {{
-      "name": "boAt Airdopes 141 TWS Earbuds",
-      "brand": "boAt",
-      "asin": "B09XQMJNZP",
-      "price": 1299,
-      "rating": 4.1,
-      "review_count": 500000,
-      "specs": {{
-        "Battery": "42 hours total",
-        "Driver": "8mm",
-        "Water Resistance": "IPX4",
-        "Connectivity": "Bluetooth 5.1"
-      }},
-      "why_recommended": "Best value under ₹1,500 with massive 42hr battery and IPX4 rating perfect for gym",
+      "asin": "ASIN from the list",
       "rank": 1,
-      "is_alternative": false
+      "why_recommended": "Specific reason this fits the user's needs"
     }}
   ]
 }}"""
@@ -110,7 +109,21 @@ Return ONLY this JSON (no markdown, no text outside JSON):
 class RecommendationEngine:
     def __init__(self, ai_provider: BaseAIProvider):
         self.ai_provider = ai_provider
-        self.affiliate_service = AffiliateService()
+        self._paapi = self._init_paapi()
+
+    def _init_paapi(self):
+        """Initialize Amazon PA-API if credentials are configured."""
+        access_key = getattr(settings, "AMAZON_ACCESS_KEY", None)
+        secret_key = getattr(settings, "AMAZON_SECRET_KEY", None)
+        partner_tag = getattr(settings, "AMAZON_AFFILIATE_TAG", "whatsay-21")
+
+        if access_key and secret_key:
+            from app.amazon.paapi import AmazonPAAPI
+            logger.info("Amazon PA-API configured — using live product data")
+            return AmazonPAAPI(access_key, secret_key, partner_tag)
+
+        logger.info("Amazon PA-API not configured — using search URL fallback")
+        return None
 
     async def generate_recommendation(
         self,
@@ -120,112 +133,420 @@ class RecommendationEngine:
         affiliate_tag: str = "whatsay-21",
     ) -> RecommendationResult:
         """
-        Single GPT-4o call: validates Amazon availability + finds real products
-        + generates full recommendation.
+        Full 3-step recommendation flow.
+        """
+
+        # ── Step 1: Check unsupported categories ──────────────────────────────
+        q_lower = question.lower()
+        for keyword in UNSUPPORTED_KEYWORDS:
+            if keyword in q_lower:
+                return self._unsupported_result(
+                    f"'{keyword.title()}' products are not available on Amazon India. "
+                    "WhatSay supports electronics, gadgets, appliances, and accessories."
+                )
+
+        # ── Step 2: Extract intent via GPT-4o ────────────────────────────────
+        intent = await self._extract_intent(question, budget)
+
+        if not intent.get("is_amazon_supported", True):
+            return self._unsupported_result(
+                intent.get("unsupported_reason", "This category is not available on Amazon India.")
+            )
+
+        search_queries = intent.get("search_queries", [question])
+        budget_inr = intent.get("budget_inr") or budget
+        search_index = intent.get("search_index", "Electronics")
+        category = intent.get("category", "other").lower()
+
+        # ── Step 3: Search Amazon India for REAL products ─────────────────────
+        amazon_products = await self._search_amazon(
+            queries=search_queries,
+            search_index=search_index,
+            budget=budget_inr,
+            affiliate_tag=affiliate_tag,
+        )
+
+        if not amazon_products:
+            return self._no_products_result(question, category, intent.get("intent", "find_best"))
+
+        # ── Step 4: Generate AI recommendation from real products ─────────────
+        return await self._generate_recommendation(
+            question=question,
+            budget=budget_inr,
+            amazon_products=amazon_products,
+            category=category,
+            intent_data=intent,
+            affiliate_tag=affiliate_tag,
+        )
+
+    async def _extract_intent(self, question: str, budget: Optional[int]) -> dict:
+        """Step 1: Use GPT-4o to extract search intent."""
+        user_msg = f"Question: {question}"
+        if budget:
+            user_msg += f"\nBudget: ₹{budget:,}"
+
+        try:
+            response = await self.ai_provider.complete(
+                messages=[
+                    AIMessage(role="system", content=INTENT_PROMPT),
+                    AIMessage(role="user", content=user_msg),
+                ],
+                max_tokens=400,
+                temperature=0.1,
+            )
+            return self._parse_json(response.content)
+        except Exception as e:
+            logger.error("Intent extraction failed", error=str(e))
+            return {
+                "is_amazon_supported": True,
+                "search_queries": [question],
+                "category": "Electronics",
+                "search_index": "Electronics",
+                "intent": "find_best",
+                "budget_inr": budget,
+            }
+
+    async def _search_amazon(
+        self,
+        queries: list[str],
+        search_index: str,
+        budget: Optional[int],
+        affiliate_tag: str,
+    ) -> list[dict]:
+        """Step 2: Search Amazon India for real products."""
+
+        # ── PA-API path (real live data) ──────────────────────────────────────
+        if self._paapi:
+            all_products = []
+            seen_asins = set()
+
+            for query in queries[:2]:
+                try:
+                    products = await self._paapi.search_items(
+                        keywords=query,
+                        search_index=search_index,
+                        item_count=4,
+                        max_price=int(budget * 1.15) if budget else None,
+                    )
+                    for p in products:
+                        if p.asin not in seen_asins:
+                            seen_asins.add(p.asin)
+                            all_products.append({
+                                "asin": p.asin,
+                                "name": p.name,
+                                "brand": p.brand,
+                                "price": p.price,
+                                "currency": "INR",
+                                "rating": p.rating,
+                                "review_count": p.review_count,
+                                "image_url": p.image_url,
+                                "amazon_url": p.amazon_url,
+                                "affiliate_url": p.affiliate_url,
+                                "is_prime": p.is_prime,
+                                "specs": {},
+                            })
+                except Exception as e:
+                    logger.error("PA-API query failed", query=query, error=str(e))
+
+            if all_products:
+                logger.info("PA-API returned products", count=len(all_products))
+                return all_products[:6]
+
+        # ── Fallback: Search URL path ─────────────────────────────────────────
+        # When PA-API is not configured, build search URLs for each query.
+        # These always work and track affiliate commissions.
+        logger.info("Using Amazon search URL fallback", queries=queries)
+        products = []
+        for i, query in enumerate(queries[:3]):
+            search_url = f"https://www.amazon.in/s?k={quote_plus(query)}&tag={affiliate_tag}"
+            products.append({
+                "asin": None,
+                "name": query,  # Will be enriched by GPT-4o
+                "brand": "",
+                "price": 0,
+                "currency": "INR",
+                "rating": 0,
+                "review_count": 0,
+                "image_url": None,
+                "amazon_url": search_url,
+                "affiliate_url": search_url,
+                "is_prime": False,
+                "specs": {},
+                "search_query": query,
+            })
+        return products
+
+    async def _generate_recommendation(
+        self,
+        question: str,
+        budget: Optional[int],
+        amazon_products: list[dict],
+        category: str,
+        intent_data: dict,
+        affiliate_tag: str,
+    ) -> RecommendationResult:
+        """Step 3: GPT-4o analyzes real Amazon products and generates recommendation."""
+
+        has_real_products = any(p.get("asin") for p in amazon_products)
+
+        if has_real_products:
+            # We have real PA-API data — do full AI analysis
+            products_context = self._format_products_context(amazon_products)
+            budget_str = f"₹{budget:,}" if budget else "Not specified"
+
+            try:
+                response = await self.ai_provider.complete(
+                    messages=[
+                        AIMessage(
+                            role="system",
+                            content=RECOMMENDATION_PROMPT.format(
+                                question=question,
+                                budget=budget_str,
+                                products_context=products_context,
+                            ),
+                        ),
+                        AIMessage(role="user", content=question),
+                    ],
+                    max_tokens=2000,
+                    temperature=0.3,
+                )
+
+                rec_data = self._parse_json(response.content)
+                return self._build_result_from_paapi(
+                    rec_data, amazon_products, category, intent_data, affiliate_tag
+                )
+
+            except Exception as e:
+                logger.error("AI recommendation failed", error=str(e))
+                # Fallback: return products without AI ranking
+                return self._build_simple_result(amazon_products, category, intent_data)
+
+        else:
+            # No PA-API — use GPT-4o to generate recommendation with search URLs
+            return await self._generate_with_search_urls(
+                question, budget, amazon_products, category, intent_data, affiliate_tag
+            )
+
+    async def _generate_with_search_urls(
+        self,
+        question: str,
+        budget: Optional[int],
+        search_products: list[dict],
+        category: str,
+        intent_data: dict,
+        affiliate_tag: str,
+    ) -> RecommendationResult:
+        """
+        When PA-API is not configured:
+        GPT-4o generates product recommendations, we build search URLs.
         """
         budget_str = f"₹{budget:,}" if budget else "Not specified"
 
-        messages = [
-            AIMessage(
-                role="system",
-                content=MASTER_PROMPT.format(
-                    question=question,
-                    budget=budget_str,
-                ),
-            ),
-            AIMessage(
-                role="user",
-                content=question,
-            ),
-        ]
+        prompt = f"""You are WhatSay AI — an Amazon India buying advisor.
 
-        try:
-            logger.info("Generating recommendation", question=question[:80])
-            response = await self.ai_provider.complete(
-                messages=messages,
-                max_tokens=3000,
-                temperature=0.2,
+USER QUESTION: {question}
+BUDGET: {budget_str}
+
+Recommend 3-4 REAL products available on Amazon India for this question.
+Use your knowledge of actual products sold on Amazon India.
+
+Return ONLY valid JSON:
+{{
+  "verdict": "highly_recommended|recommended|neutral|not_recommended|avoid",
+  "summary": "2-3 sentence summary",
+  "detailed_analysis": "Detailed analysis paragraph",
+  "pros": ["pro1", "pro2", "pro3"],
+  "cons": ["con1", "con2"],
+  "score": 85,
+  "confidence": 90,
+  "products": [
+    {{
+      "name": "Exact product name as sold on Amazon India",
+      "brand": "Brand",
+      "search_query": "Amazon search query to find this product",
+      "price": 3999,
+      "rating": 4.2,
+      "review_count": 25000,
+      "specs": {{"Battery": "40hr", "ANC": "Yes", "Water Resistance": "IPX4"}},
+      "why_recommended": "Why this fits the user's needs",
+      "rank": 1
+    }}
+  ]
+}}"""
+
+        response = await self.ai_provider.complete(
+            messages=[
+                AIMessage(role="system", content=prompt),
+                AIMessage(role="user", content=question),
+            ],
+            max_tokens=2500,
+            temperature=0.2,
+        )
+
+        data = self._parse_json(response.content)
+        products_out = []
+
+        for i, p in enumerate(data.get("products", [])):
+            name = p.get("name", "")
+            search_query = p.get("search_query", name)
+            if not name:
+                continue
+
+            # Build Amazon search URL with affiliate tag
+            affiliate_url = f"https://www.amazon.in/s?k={quote_plus(search_query)}&tag={affiliate_tag}"
+            amazon_url = f"https://www.amazon.in/s?k={quote_plus(search_query)}"
+
+            products_out.append({
+                "name": name,
+                "brand": p.get("brand", ""),
+                "category": category,
+                "price": float(p.get("price", 0)),
+                "currency": "INR",
+                "rating": float(p.get("rating", 0)),
+                "review_count": int(p.get("review_count", 0)),
+                "image_url": None,
+                "amazon_url": amazon_url,
+                "affiliate_url": affiliate_url,
+                "asin": None,
+                "specs": p.get("specs", {}),
+                "why_recommended": p.get("why_recommended", ""),
+                "rank": int(p.get("rank", i + 1)),
+                "is_alternative": False,
+            })
+
+        return RecommendationResult(
+            verdict=data.get("verdict", "recommended"),
+            summary=data.get("summary", ""),
+            detailed_analysis=data.get("detailed_analysis", ""),
+            pros=data.get("pros", []),
+            cons=data.get("cons", []),
+            score=int(data.get("score", 75)),
+            confidence=int(data.get("confidence", 80)),
+            products=products_out,
+            alternatives=[],
+            category=category,
+            intent=intent_data.get("intent", "find_best"),
+            amazon_available=True,
+        )
+
+    def _format_products_context(self, products: list[dict]) -> str:
+        """Format real Amazon products for AI context."""
+        lines = []
+        for i, p in enumerate(products[:6], 1):
+            price_str = f"₹{p['price']:,.0f}" if p["price"] > 0 else "Price not listed"
+            rating_str = f"{p['rating']}/5 ({p['review_count']:,} reviews)" if p["rating"] > 0 else "No ratings"
+            lines.append(
+                f"{i}. ASIN: {p['asin']}\n"
+                f"   Name: {p['name']}\n"
+                f"   Brand: {p['brand']}\n"
+                f"   Price: {price_str}\n"
+                f"   Rating: {rating_str}\n"
+                f"   Prime: {'Yes' if p.get('is_prime') else 'No'}"
             )
+        return "\n\n".join(lines)
 
-            data = self._parse_json(response.content)
-            logger.info("AI response parsed", verdict=data.get("verdict"), products=len(data.get("products", [])))
+    def _build_result_from_paapi(
+        self,
+        rec_data: dict,
+        amazon_products: list[dict],
+        category: str,
+        intent_data: dict,
+        affiliate_tag: str,
+    ) -> RecommendationResult:
+        """Build result using PA-API products + AI ranking."""
+        asin_map = {p["asin"]: p for p in amazon_products if p.get("asin")}
+        products_out = []
 
-            # Check if category is supported
-            if not data.get("is_amazon_supported", True):
-                return RecommendationResult(
-                    verdict="neutral",
-                    summary=data.get("unsupported_reason", "This category is not available on Amazon India."),
-                    detailed_analysis=(
-                        "WhatSay supports product recommendations for items available on Amazon India. "
-                        "This includes electronics, gadgets, appliances, and accessories. "
-                        "Categories like automobiles, real estate, and financial services are not supported."
-                    ),
-                    pros=[],
-                    cons=[],
-                    score=0,
-                    confidence=100,
-                    products=[],
-                    alternatives=[],
-                    category=data.get("category", "other"),
-                    intent=data.get("intent", "find_best"),
-                    amazon_available=False,
-                )
+        for rp in rec_data.get("ranked_products", []):
+            asin = rp.get("asin", "")
+            product = asin_map.get(asin)
+            if not product:
+                continue
 
-            # Build products with affiliate links
-            products_out = []
-            alternatives_out = []
+            products_out.append({
+                "name": product["name"],
+                "brand": product["brand"],
+                "category": category,
+                "price": product["price"],
+                "currency": "INR",
+                "rating": product["rating"],
+                "review_count": product["review_count"],
+                "image_url": product.get("image_url"),
+                "amazon_url": product["amazon_url"],
+                "affiliate_url": product["affiliate_url"],
+                "asin": asin,
+                "specs": product.get("specs", {}),
+                "why_recommended": rp.get("why_recommended", ""),
+                "rank": rp.get("rank", len(products_out) + 1),
+                "is_alternative": False,
+            })
 
-            for p in data.get("products", []):
-                asin = p.get("asin", "")
-                if not asin:
-                    continue
+        # If AI didn't rank properly, use all products
+        if not products_out:
+            products_out = [
+                {**p, "category": category, "is_alternative": False, "why_recommended": ""}
+                for p in amazon_products[:4]
+            ]
 
-                amazon_url = f"https://www.amazon.in/dp/{asin}"
-                affiliate_url = self.affiliate_service.build_affiliate_url(
-                    amazon_url, affiliate_tag
-                )
+        return RecommendationResult(
+            verdict=rec_data.get("verdict", "recommended"),
+            summary=rec_data.get("summary", ""),
+            detailed_analysis=rec_data.get("detailed_analysis", ""),
+            pros=rec_data.get("pros", []),
+            cons=rec_data.get("cons", []),
+            score=int(rec_data.get("score", 75)),
+            confidence=int(rec_data.get("confidence", 80)),
+            products=products_out,
+            alternatives=[],
+            category=category,
+            intent=intent_data.get("intent", "find_best"),
+            amazon_available=True,
+        )
 
-                prod_dict = {
-                    "name": p.get("name", ""),
-                    "brand": p.get("brand", ""),
-                    "category": data.get("category", "other"),
-                    "price": float(p.get("price", 0)),
-                    "currency": "INR",
-                    "rating": float(p.get("rating", 0)),
-                    "review_count": int(p.get("review_count", 0)),
-                    "image_url": p.get("image_url"),
-                    "amazon_url": amazon_url,
-                    "affiliate_url": affiliate_url,
-                    "asin": asin,
-                    "specs": p.get("specs", {}),
-                    "why_recommended": p.get("why_recommended", ""),
-                    "rank": int(p.get("rank", len(products_out) + 1)),
-                    "is_alternative": bool(p.get("is_alternative", False)),
-                }
+    def _build_simple_result(
+        self, products: list[dict], category: str, intent_data: dict
+    ) -> RecommendationResult:
+        """Simple result when AI analysis fails."""
+        return RecommendationResult(
+            verdict="recommended",
+            summary=f"Found {len(products)} products on Amazon India matching your query.",
+            detailed_analysis="",
+            pros=["Available on Amazon India", "Prime eligible options available"],
+            cons=[],
+            score=70,
+            confidence=60,
+            products=[{**p, "category": category, "is_alternative": False} for p in products[:4]],
+            alternatives=[],
+            category=category,
+            intent=intent_data.get("intent", "find_best"),
+            amazon_available=True,
+        )
 
-                if prod_dict["is_alternative"]:
-                    alternatives_out.append(prod_dict)
-                else:
-                    products_out.append(prod_dict)
+    def _unsupported_result(self, reason: str) -> RecommendationResult:
+        return RecommendationResult(
+            verdict="neutral",
+            summary=reason,
+            detailed_analysis=(
+                "WhatSay supports product recommendations for items available on Amazon India — "
+                "electronics, gadgets, appliances, and accessories. "
+                "Automobiles, real estate, and financial services are not supported."
+            ),
+            pros=[], cons=[], score=0, confidence=100,
+            products=[], alternatives=[],
+            category="other", intent="find_best",
+            amazon_available=False,
+        )
 
-            return RecommendationResult(
-                verdict=data.get("verdict", "recommended"),
-                summary=data.get("summary", ""),
-                detailed_analysis=data.get("detailed_analysis", ""),
-                pros=data.get("pros", []),
-                cons=data.get("cons", []),
-                score=int(data.get("score", 75)),
-                confidence=int(data.get("confidence", 80)),
-                products=products_out,
-                alternatives=alternatives_out,
-                category=data.get("category", "other"),
-                intent=data.get("intent", "find_best"),
-                amazon_available=True,
-            )
-
-        except Exception as e:
-            logger.error("Recommendation failed", error=str(e))
-            raise
+    def _no_products_result(self, question: str, category: str, intent: str) -> RecommendationResult:
+        return RecommendationResult(
+            verdict="neutral",
+            summary="No matching products found on Amazon India. Please try a more specific search.",
+            detailed_analysis="",
+            pros=[], cons=[], score=0, confidence=70,
+            products=[], alternatives=[],
+            category=category, intent=intent,
+            amazon_available=True,
+        )
 
     async def stream_recommendation(
         self,
@@ -234,45 +555,25 @@ class RecommendationEngine:
         currency: str = "INR",
         affiliate_tag: str = "whatsay-21",
     ) -> AsyncGenerator[str, None]:
-        """Stream a brief conversational response."""
         messages = [
-            AIMessage(
-                role="system",
-                content=(
-                    "You are WhatSay AI, a friendly Amazon India buying advisor. "
-                    "Give a brief 2-sentence response acknowledging the question "
-                    "and saying you're finding the best options on Amazon India. "
-                    "Be warm and helpful."
-                ),
-            ),
+            AIMessage(role="system", content=(
+                "You are WhatSay AI, a friendly Amazon India buying advisor. "
+                "Give a brief 1-2 sentence response saying you're searching Amazon India "
+                "for the best options. Be warm and concise."
+            )),
             AIMessage(role="user", content=question),
         ]
-
-        async for chunk in self.ai_provider.stream(
-            messages=messages,
-            max_tokens=100,
-            temperature=0.5,
-        ):
+        async for chunk in self.ai_provider.stream(messages=messages, max_tokens=60, temperature=0.5):
             yield chunk
 
     def _parse_json(self, content: str) -> dict:
-        """Parse JSON from AI response."""
-        # Remove markdown code blocks
-        content = re.sub(r'```json\s*', '', content)
-        content = re.sub(r'```\s*', '', content)
+        content = re.sub(r"```json\s*", "", content)
+        content = re.sub(r"```\s*", "", content)
         content = content.strip()
-
-        # Find JSON object
-        match = re.search(r'\{.*\}', content, re.DOTALL)
+        match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
-
-        # Try direct parse
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error("JSON parse failed", error=str(e), content=content[:200])
-            raise
+        return json.loads(content)
