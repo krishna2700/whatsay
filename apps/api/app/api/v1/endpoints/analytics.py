@@ -1,3 +1,16 @@
+"""
+Analytics Endpoints
+
+Tracks the full funnel:
+  Question Asked
+  → Recommendation Generated
+  → Affiliate Click (user trusted the recommendation)
+  → Purchase (tracked via Amazon Associates dashboard)
+
+Key KPI: Trust Score = Clicks / Recommendations
+This tells us: are users trusting WhatSay's recommendations enough to buy?
+"""
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
@@ -21,11 +34,10 @@ async def get_analytics_summary(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AnalyticsSummaryResponse:
-    # Total questions for this user
+
+    # Total questions
     q_count = await db.execute(
-        select(func.count()).select_from(Question).where(
-            Question.user_id == current_user.id
-        )
+        select(func.count()).select_from(Question).where(Question.user_id == current_user.id)
     )
     total_questions = q_count.scalar_one()
 
@@ -45,8 +57,9 @@ async def get_analytics_summary(
     )
     total_clicks = click_count.scalar_one()
 
-    # CTR
-    ctr = (total_clicks / total_recommendations * 100) if total_recommendations > 0 else 0.0
+    # Trust Score = (affiliate clicks / recommendations) * 100
+    # This is the KEY metric — how often do users trust the recommendation enough to click Buy?
+    trust_score = (total_clicks / total_recommendations * 100) if total_recommendations > 0 else 0.0
 
     # Questions today
     today = date.today()
@@ -119,7 +132,7 @@ async def get_analytics_summary(
         total_recommendations=total_recommendations,
         total_affiliate_clicks=total_clicks,
         total_users=1,
-        ctr=round(ctr, 2),
+        ctr=round(trust_score, 2),  # Trust Score replaces generic CTR
         questions_today=questions_today,
         clicks_today=clicks_today,
         top_categories=top_categories,

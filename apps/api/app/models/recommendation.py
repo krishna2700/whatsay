@@ -36,6 +36,17 @@ class Recommendation(Base, UUIDMixin, TimestampMixin):
     ai_provider: Mapped[str] = mapped_column(String(50), nullable=False)
     tokens_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # ── Trust Score / Recommendation Quality Tracking ─────────────────────────
+    # Tracks: Question → Recommendation → Click → (Purchase if available)
+    # This is the real KPI: can users trust the recommendation enough to click Buy?
+    affiliate_click_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    helpful_votes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    not_helpful_votes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # trust_score = (clicks + helpful) / views — computed property
+    product_source: Mapped[str] = mapped_column(
+        String(20), default="serpapi", nullable=False
+    )  # "serpapi" | "paapi" | "none"
+
     # Relationships
     question: Mapped["Question"] = relationship("Question", back_populates="recommendation")  # type: ignore
     products: Mapped[list["RecommendedProduct"]] = relationship(

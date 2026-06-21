@@ -1,19 +1,22 @@
 """
 WhatSay AI Recommendation Engine
 
-REAL 3-Step Flow:
+STRICT RULES (non-negotiable):
+  1. NEVER let GPT invent products, prices, ASINs, or ratings
+  2. ALWAYS require real Amazon search results before showing recommendations
+  3. If no search API is configured → return clear error, not hallucinated data
+  4. Affiliate links: /dp/ASIN?tag=... when ASIN exists, /s?k=...&tag=... otherwise
+
+Data flow:
   Step 1 — Intent (GPT-4o): question → search queries + category + budget
-  Step 2 — Search (SerpAPI): queries → REAL Amazon India products (live ASINs, prices, images)
-  Step 3 — Recommend (GPT-4o): real products → honest verdict + pros/cons + ranking
+  Step 2 — Search (SerpAPI PRIMARY): real Amazon India products with live data
+             PA-API: future upgrade after Associates qualification
+             No API: return "search unavailable" error — NO GPT fallback
+  Step 3 — Recommend (GPT-4o): analyzes REAL products → verdict + ranking
 
-Data sources (priority order):
-  1. SerpAPI → real live Amazon India search (configure SERPAPI_KEY)
-  2. Amazon PA-API → official Amazon API (configure AMAZON_ACCESS_KEY + AMAZON_SECRET_KEY)
-  3. Fallback → GPT-4o knowledge + Amazon search URLs (no API key needed)
-
-Affiliate links:
-  - With SerpAPI/PA-API: https://www.amazon.in/dp/REAL_ASIN?tag=whatsay-21
-  - Fallback: https://www.amazon.in/s?k=PRODUCT+NAME&tag=whatsay-21
+SerpAPI is the ONLY product source for MVP.
+PA-API is the future upgrade path.
+GPT never generates product data.
 """
 
 import json
@@ -53,83 +56,49 @@ Rules:
 - is_amazon_supported = false ONLY for: cars, real estate, flights, insurance, loans
 - Generate 2-3 specific Amazon India search queries (short, keyword-focused)
 - budget_inr: extract number if mentioned (5000 for "under ₹5,000")
-- Queries should work well as Amazon search terms
 
 Examples:
 Q: "Best earbuds under 5000 for gym"
-→ {"search_queries": ["wireless earbuds under 5000", "sports earbuds waterproof gym", "bluetooth earbuds IPX5"], "budget_inr": 5000, "category": "audio"}
+→ {"search_queries": ["wireless earbuds under 5000", "sports earbuds waterproof gym"], "budget_inr": 5000, "category": "audio"}
 
 Q: "Should I buy iPhone 15?"
 → {"search_queries": ["Apple iPhone 15 128GB", "Apple iPhone 15"], "category": "smartphones"}
 
-Q: "Best laptop under 80000 for programming"
-→ {"search_queries": ["laptop under 80000 programming", "developer laptop i7 16GB"], "budget_inr": 80000, "category": "laptops"}
-
 Q: "Should I buy Tata Nexon?"
 → {"is_amazon_supported": false, "unsupported_reason": "Cars and automobiles are not available on Amazon India."}"""
 
-# ─── Step 3: Recommendation from real products ────────────────────────────────
+# ─── Step 3: Recommendation from REAL products ───────────────────────────────
 RECOMMENDATION_PROMPT = """You are WhatSay AI — an honest Amazon India buying advisor.
 
 USER QUESTION: {question}
 BUDGET: {budget}
 
-REAL AMAZON INDIA PRODUCTS (live data from Amazon search):
+REAL AMAZON INDIA PRODUCTS (fetched live from Amazon search):
 {products_context}
 
-Analyze these REAL products and generate a buying recommendation.
-Only recommend products from the list above. Be specific and honest.
+Analyze ONLY these real products. Do NOT invent or add any products not in the list.
+Be specific, honest, and mention actual product names and prices from the list.
 
 Return ONLY valid JSON:
 {{
   "verdict": "highly_recommended|recommended|neutral|not_recommended|avoid",
-  "summary": "2-3 sentence summary mentioning specific product names and prices",
-  "detailed_analysis": "Detailed paragraph with specific reasons why these products suit the user",
-  "pros": ["specific pro with product name", "specific pro 2", "specific pro 3"],
-  "cons": ["specific con 1", "specific con 2"],
+  "summary": "2-3 sentence summary mentioning specific product names and prices from the list",
+  "detailed_analysis": "Detailed paragraph with specific reasons referencing actual products above",
+  "pros": ["specific pro mentioning product name", "pro 2", "pro 3"],
+  "cons": ["specific con 1", "con 2"],
   "score": 85,
   "confidence": 92,
   "ranked_asins": [
     {{
-      "asin": "ASIN_FROM_LIST",
+      "asin": "EXACT_ASIN_FROM_LIST_ABOVE",
       "rank": 1,
       "why_recommended": "Specific reason this product fits the user's exact needs"
     }}
   ]
-}}"""
+}}
 
-# ─── Fallback: GPT-4o generates products when no API ─────────────────────────
-FALLBACK_PROMPT = """You are WhatSay AI — an Amazon India buying advisor.
-
-USER QUESTION: {question}
-BUDGET: {budget}
-
-Recommend 3-4 REAL products available on Amazon India.
-Use your knowledge of actual products sold on Amazon India right now.
-
-Return ONLY valid JSON:
-{{
-  "verdict": "highly_recommended|recommended|neutral|not_recommended|avoid",
-  "summary": "2-3 sentence summary with specific product names",
-  "detailed_analysis": "Detailed analysis paragraph",
-  "pros": ["pro1", "pro2", "pro3"],
-  "cons": ["con1", "con2"],
-  "score": 85,
-  "confidence": 75,
-  "products": [
-    {{
-      "name": "Exact product name as sold on Amazon India",
-      "brand": "Brand name",
-      "search_query": "Amazon search query to find this exact product",
-      "price": 3999,
-      "rating": 4.2,
-      "review_count": 25000,
-      "specs": {{"Battery": "40hr", "ANC": "Yes", "Water Resistance": "IPX4"}},
-      "why_recommended": "Why this fits the user's specific needs",
-      "rank": 1
-    }}
-  ]
-}}"""
+IMPORTANT: ranked_asins must only contain ASINs from the product list above.
+Do NOT add products that are not in the list."""
 
 
 class RecommendationEngine:
@@ -139,24 +108,28 @@ class RecommendationEngine:
         self.paapi_client = self._init_paapi()
 
     def _init_serp(self):
-        """Initialize SerpAPI client if key is configured."""
+        """Initialize SerpAPI — PRIMARY product source for MVP."""
         key = getattr(settings, "SERPAPI_KEY", None)
         if key:
             from app.amazon.serp_search import SerpAPIAmazonSearch
-            logger.info("✅ SerpAPI configured — real Amazon India search active")
+            logger.info("✅ SerpAPI active — real Amazon India search enabled")
             return SerpAPIAmazonSearch(api_key=key, affiliate_tag=settings.AMAZON_AFFILIATE_TAG)
-        logger.info("⚠️  SerpAPI not configured — using GPT-4o fallback")
+        logger.warning("⚠️  SERPAPI_KEY not set — product search unavailable")
         return None
 
     def _init_paapi(self):
-        """Initialize Amazon PA-API if credentials configured."""
+        """Initialize PA-API — future upgrade after Associates qualification."""
         access_key = getattr(settings, "AMAZON_ACCESS_KEY", None)
         secret_key = getattr(settings, "AMAZON_SECRET_KEY", None)
         if access_key and secret_key:
             from app.amazon.paapi import AmazonPAAPI
-            logger.info("✅ Amazon PA-API configured")
+            logger.info("✅ Amazon PA-API active")
             return AmazonPAAPI(access_key, secret_key, settings.AMAZON_AFFILIATE_TAG)
         return None
+
+    def _search_available(self) -> bool:
+        """Check if any real Amazon search API is configured."""
+        return self.serp_client is not None or self.paapi_client is not None
 
     async def generate_recommendation(
         self,
@@ -165,9 +138,12 @@ class RecommendationEngine:
         currency: str = "INR",
         affiliate_tag: str = "whatsay-21",
     ) -> RecommendationResult:
-        """Full recommendation flow."""
+        """
+        Full recommendation flow.
+        REQUIRES real Amazon search API — never uses GPT to invent products.
+        """
 
-        # ── Quick unsupported category check ─────────────────────────────────
+        # ── Check unsupported categories ──────────────────────────────────────
         q_lower = question.lower()
         for keyword in UNSUPPORTED_KEYWORDS:
             if keyword in q_lower:
@@ -175,6 +151,10 @@ class RecommendationEngine:
                     f"'{keyword.title()}' products are not available on Amazon India. "
                     "WhatSay supports electronics, gadgets, appliances, and accessories."
                 )
+
+        # ── CRITICAL: Require real search API ─────────────────────────────────
+        if not self._search_available():
+            return self._search_unavailable_result()
 
         # ── Step 1: Extract intent ────────────────────────────────────────────
         intent = await self._extract_intent(question, budget)
@@ -188,36 +168,31 @@ class RecommendationEngine:
         budget_inr = intent.get("budget_inr") or budget
         category = intent.get("category", "other")
 
-        # ── Step 2: Search Amazon India ───────────────────────────────────────
-        if self.serp_client:
-            # REAL search via SerpAPI
-            amazon_products = await self.serp_client.search_multiple(
-                queries=search_queries,
-                max_per_query=4,
-                budget=budget_inr,
-            )
-            if amazon_products:
-                logger.info("SerpAPI products found", count=len(amazon_products))
-                return await self._recommend_from_real_products(
-                    question, budget_inr, amazon_products, category, intent, affiliate_tag
-                )
+        # ── Step 2: Search Amazon India for REAL products ─────────────────────
+        amazon_products = await self._search_amazon(
+            queries=search_queries,
+            budget=budget_inr,
+            affiliate_tag=affiliate_tag,
+        )
 
-        elif self.paapi_client:
-            # REAL search via PA-API
-            amazon_products = await self._search_paapi(search_queries, budget_inr)
-            if amazon_products:
-                return await self._recommend_from_real_products(
-                    question, budget_inr, amazon_products, category, intent, affiliate_tag
-                )
+        # No products found — do NOT fall back to GPT
+        if not amazon_products:
+            return self._no_products_result(category, intent.get("intent", "find_best"))
 
-        # ── Fallback: GPT-4o knowledge + search URLs ──────────────────────────
-        logger.info("Using GPT-4o fallback (no search API configured)")
-        return await self._fallback_recommendation(
-            question, budget_inr, category, intent, affiliate_tag
+        logger.info("Real Amazon products fetched", count=len(amazon_products))
+
+        # ── Step 3: GPT-4o analyzes REAL products ─────────────────────────────
+        return await self._recommend_from_real_products(
+            question=question,
+            budget=budget_inr,
+            amazon_products=amazon_products,
+            category=category,
+            intent=intent,
+            affiliate_tag=affiliate_tag,
         )
 
     async def _extract_intent(self, question: str, budget: Optional[int]) -> dict:
-        """Step 1: GPT-4o extracts search intent."""
+        """Step 1: GPT-4o extracts search intent only — no product generation."""
         user_msg = f"Question: {question}"
         if budget:
             user_msg += f"\nBudget: ₹{budget:,}"
@@ -241,69 +216,113 @@ class RecommendationEngine:
                 "budget_inr": budget,
             }
 
-    async def _search_paapi(self, queries: list[str], budget: Optional[int]) -> list[dict]:
-        """Search via Amazon PA-API."""
-        all_products = []
-        seen_asins = set()
-        for query in queries[:2]:
+    async def _search_amazon(
+        self,
+        queries: list[str],
+        budget: Optional[int],
+        affiliate_tag: str,
+    ) -> list[dict]:
+        """
+        Step 2: Search Amazon India for REAL products.
+        SerpAPI is primary. PA-API is future upgrade.
+        Returns empty list if no results — never invents products.
+        """
+
+        # ── SerpAPI (Primary for MVP) ─────────────────────────────────────────
+        if self.serp_client:
             try:
-                products = await self.paapi_client.search_items(
-                    keywords=query,
-                    item_count=4,
-                    max_price=int(budget * 1.15) if budget else None,
+                products = await self.serp_client.search_multiple(
+                    queries=queries,
+                    max_per_query=4,
+                    budget=budget,
                 )
-                for p in products:
-                    if p.asin not in seen_asins:
-                        seen_asins.add(p.asin)
-                        all_products.append({
-                            "asin": p.asin,
-                            "name": p.name,
-                            "brand": p.brand,
-                            "price": p.price,
-                            "currency": "INR",
-                            "rating": p.rating,
-                            "review_count": p.review_count,
-                            "image_url": p.image_url,
-                            "amazon_url": p.amazon_url,
-                            "affiliate_url": p.affiliate_url,
-                            "specs": {},
-                        })
+                if products:
+                    return [self._serp_to_dict(p, affiliate_tag) for p in products]
             except Exception as e:
-                logger.error("PA-API query failed", error=str(e))
-        return all_products[:6]
+                logger.error("SerpAPI search failed", error=str(e))
+
+        # ── PA-API (Future upgrade) ───────────────────────────────────────────
+        if self.paapi_client:
+            try:
+                all_products = []
+                seen_asins = set()
+                for query in queries[:2]:
+                    items = await self.paapi_client.search_items(
+                        keywords=query,
+                        item_count=4,
+                        max_price=int(budget * 1.15) if budget else None,
+                    )
+                    for p in items:
+                        if p.asin not in seen_asins:
+                            seen_asins.add(p.asin)
+                            all_products.append({
+                                "asin": p.asin,
+                                "name": p.name,
+                                "brand": p.brand,
+                                "price": p.price,
+                                "currency": "INR",
+                                "rating": p.rating,
+                                "review_count": p.review_count,
+                                "image_url": p.image_url,
+                                "amazon_url": p.amazon_url,
+                                # Direct product URL with affiliate tag
+                                "affiliate_url": f"https://www.amazon.in/dp/{p.asin}?tag={affiliate_tag}",
+                                "specs": {},
+                                "source": "paapi",
+                            })
+                if all_products:
+                    return all_products[:6]
+            except Exception as e:
+                logger.error("PA-API search failed", error=str(e))
+
+        return []
+
+    def _serp_to_dict(self, product, affiliate_tag: str) -> dict:
+        """
+        Convert SerpAPI product to dict with correct affiliate URL.
+        - Has ASIN → direct /dp/ASIN?tag=... link (exact product page)
+        - No ASIN → search /s?k=NAME&tag=... link (always works)
+        """
+        asin = getattr(product, "asin", None)
+        name = getattr(product, "name", "")
+
+        if asin:
+            # Real ASIN from Amazon — direct product page
+            amazon_url = f"https://www.amazon.in/dp/{asin}"
+            affiliate_url = f"{amazon_url}?tag={affiliate_tag}"
+        else:
+            # No ASIN — use search URL (still tracks affiliate)
+            encoded = quote_plus(name)
+            amazon_url = f"https://www.amazon.in/s?k={encoded}"
+            affiliate_url = f"{amazon_url}&tag={affiliate_tag}"
+
+        return {
+            "asin": asin,
+            "name": name,
+            "brand": getattr(product, "brand", ""),
+            "price": getattr(product, "price", 0),
+            "currency": "INR",
+            "rating": getattr(product, "rating", 0),
+            "review_count": getattr(product, "review_count", 0),
+            "image_url": getattr(product, "image_url", None),
+            "amazon_url": amazon_url,
+            "affiliate_url": affiliate_url,
+            "specs": {},
+            "source": "serpapi",
+        }
 
     async def _recommend_from_real_products(
         self,
         question: str,
         budget: Optional[int],
-        products: list,
+        amazon_products: list[dict],
         category: str,
         intent: dict,
         affiliate_tag: str,
     ) -> RecommendationResult:
-        """Step 3: GPT-4o analyzes REAL Amazon products."""
+        """Step 3: GPT-4o analyzes REAL Amazon products and ranks them."""
 
-        # Convert SerpAPI AmazonProduct objects to dicts if needed
-        product_dicts = []
-        for p in products:
-            if hasattr(p, "asin"):
-                product_dicts.append({
-                    "asin": p.asin,
-                    "name": p.name,
-                    "brand": p.brand,
-                    "price": p.price,
-                    "currency": "INR",
-                    "rating": p.rating,
-                    "review_count": p.review_count,
-                    "image_url": p.image_url,
-                    "amazon_url": p.amazon_url,
-                    "affiliate_url": f"https://www.amazon.in/dp/{p.asin}?tag={affiliate_tag}",
-                    "specs": getattr(p, "specs", {}),
-                })
-            else:
-                product_dicts.append(p)
-
-        products_context = self._format_products_context(product_dicts)
+        products_context = self._format_products_context(amazon_products)
         budget_str = f"₹{budget:,}" if budget else "Not specified"
 
         try:
@@ -325,17 +344,19 @@ class RecommendationEngine:
             rec_data = self._parse_json(response.content)
         except Exception as e:
             logger.error("AI recommendation failed", error=str(e))
-            rec_data = {"verdict": "recommended", "summary": "", "pros": [], "cons": [], "score": 70, "confidence": 60}
+            # Return products without AI ranking — still real data
+            return self._build_unranked_result(amazon_products, category, intent)
 
-        # Map ranked ASINs back to full product data
-        asin_map = {p["asin"]: p for p in product_dicts if p.get("asin")}
+        # Map ranked ASINs back to real product data
+        asin_map = {p["asin"]: p for p in amazon_products if p.get("asin")}
         products_out = []
 
         for rp in rec_data.get("ranked_asins", []):
             asin = rp.get("asin", "")
             product = asin_map.get(asin)
             if not product:
-                continue
+                continue  # Skip — only use products from real search results
+
             products_out.append({
                 "name": product["name"],
                 "brand": product["brand"],
@@ -346,7 +367,7 @@ class RecommendationEngine:
                 "review_count": product["review_count"],
                 "image_url": product.get("image_url"),
                 "amazon_url": product["amazon_url"],
-                "affiliate_url": product["affiliate_url"],
+                "affiliate_url": product["affiliate_url"],  # Correct URL already set
                 "asin": asin,
                 "specs": product.get("specs", {}),
                 "why_recommended": rp.get("why_recommended", ""),
@@ -354,18 +375,9 @@ class RecommendationEngine:
                 "is_alternative": False,
             })
 
-        # If AI didn't rank, use all products in order
+        # If AI ranking failed, use all real products in search order
         if not products_out:
-            products_out = [
-                {
-                    **p,
-                    "category": category,
-                    "is_alternative": False,
-                    "why_recommended": "",
-                    "rank": i + 1,
-                }
-                for i, p in enumerate(product_dicts[:4])
-            ]
+            return self._build_unranked_result(amazon_products, category, intent)
 
         return RecommendationResult(
             verdict=rec_data.get("verdict", "recommended"),
@@ -382,80 +394,16 @@ class RecommendationEngine:
             amazon_available=True,
         )
 
-    async def _fallback_recommendation(
-        self,
-        question: str,
-        budget: Optional[int],
-        category: str,
-        intent: dict,
-        affiliate_tag: str,
-    ) -> RecommendationResult:
-        """Fallback when no search API is configured."""
-        budget_str = f"₹{budget:,}" if budget else "Not specified"
-
-        response = await self.ai_provider.complete(
-            messages=[
-                AIMessage(
-                    role="system",
-                    content=FALLBACK_PROMPT.format(question=question, budget=budget_str),
-                ),
-                AIMessage(role="user", content=question),
-            ],
-            max_tokens=2500,
-            temperature=0.2,
-        )
-
-        data = self._parse_json(response.content)
-        products_out = []
-
-        for i, p in enumerate(data.get("products", [])):
-            name = p.get("name", "")
-            search_query = p.get("search_query", name)
-            if not name:
-                continue
-
-            # Amazon search URL — always works, affiliate tracked
-            affiliate_url = f"https://www.amazon.in/s?k={quote_plus(search_query)}&tag={affiliate_tag}"
-            amazon_url = f"https://www.amazon.in/s?k={quote_plus(search_query)}"
-
-            products_out.append({
-                "name": name,
-                "brand": p.get("brand", ""),
-                "category": category,
-                "price": float(p.get("price", 0)),
-                "currency": "INR",
-                "rating": float(p.get("rating", 0)),
-                "review_count": int(p.get("review_count", 0)),
-                "image_url": None,
-                "amazon_url": amazon_url,
-                "affiliate_url": affiliate_url,
-                "asin": None,
-                "specs": p.get("specs", {}),
-                "why_recommended": p.get("why_recommended", ""),
-                "rank": int(p.get("rank", i + 1)),
-                "is_alternative": False,
-            })
-
-        return RecommendationResult(
-            verdict=data.get("verdict", "recommended"),
-            summary=data.get("summary", ""),
-            detailed_analysis=data.get("detailed_analysis", ""),
-            pros=data.get("pros", []),
-            cons=data.get("cons", []),
-            score=int(data.get("score", 75)),
-            confidence=int(data.get("confidence", 75)),
-            products=products_out,
-            alternatives=[],
-            category=category,
-            intent=intent.get("intent", "find_best"),
-            amazon_available=True,
-        )
-
     def _format_products_context(self, products: list[dict]) -> str:
+        """Format real Amazon products for GPT-4o context."""
         lines = []
         for i, p in enumerate(products[:6], 1):
             price_str = f"₹{p['price']:,.0f}" if p.get("price", 0) > 0 else "Price not listed"
-            rating_str = f"{p['rating']}/5 ({p['review_count']:,} reviews)" if p.get("rating", 0) > 0 else "No ratings yet"
+            rating_str = (
+                f"{p['rating']}/5 ({p['review_count']:,} reviews)"
+                if p.get("rating", 0) > 0
+                else "No ratings yet"
+            )
             lines.append(
                 f"{i}. ASIN: {p.get('asin', 'N/A')}\n"
                 f"   Name: {p['name']}\n"
@@ -465,6 +413,66 @@ class RecommendationEngine:
                 f"   URL: {p.get('amazon_url', '')}"
             )
         return "\n\n".join(lines)
+
+    def _build_unranked_result(
+        self, products: list[dict], category: str, intent: dict
+    ) -> RecommendationResult:
+        """Return real products without AI ranking when GPT analysis fails."""
+        products_out = [
+            {
+                **p,
+                "category": category,
+                "is_alternative": False,
+                "why_recommended": "",
+                "rank": i + 1,
+            }
+            for i, p in enumerate(products[:4])
+        ]
+        return RecommendationResult(
+            verdict="recommended",
+            summary=f"Found {len(products_out)} products on Amazon India matching your query.",
+            detailed_analysis="",
+            pros=["Available on Amazon India", "Real-time pricing"],
+            cons=[],
+            score=70,
+            confidence=60,
+            products=products_out,
+            alternatives=[],
+            category=category,
+            intent=intent.get("intent", "find_best"),
+            amazon_available=True,
+        )
+
+    # ─── Error results ────────────────────────────────────────────────────────
+
+    def _search_unavailable_result(self) -> RecommendationResult:
+        """
+        Returned when no search API is configured.
+        NEVER fall back to GPT-invented products.
+        """
+        return RecommendationResult(
+            verdict="neutral",
+            summary=(
+                "Live Amazon product search is currently unavailable. "
+                "Please configure SerpAPI to enable real product recommendations."
+            ),
+            detailed_analysis=(
+                "WhatSay requires a live Amazon India product search to generate recommendations. "
+                "This ensures every recommendation is based on real products with real prices — "
+                "never AI-invented data. "
+                "To enable: add SERPAPI_KEY to your environment variables. "
+                "Sign up free at serpapi.com (100 searches/month free tier)."
+            ),
+            pros=[],
+            cons=[],
+            score=0,
+            confidence=0,
+            products=[],
+            alternatives=[],
+            category="other",
+            intent="find_best",
+            amazon_available=False,
+        )
 
     def _unsupported_result(self, reason: str) -> RecommendationResult:
         return RecommendationResult(
@@ -481,6 +489,26 @@ class RecommendationEngine:
             amazon_available=False,
         )
 
+    def _no_products_result(self, category: str, intent: str) -> RecommendationResult:
+        """Returned when Amazon search returns no results — never invent products."""
+        return RecommendationResult(
+            verdict="neutral",
+            summary=(
+                "No matching products found on Amazon India for your query. "
+                "Try a more specific product name or different keywords."
+            ),
+            detailed_analysis=(
+                "Our live Amazon India search did not return results for this query. "
+                "This may be because the product is out of stock, not available in India, "
+                "or the search terms need to be more specific. "
+                "Try searching with the exact product model number."
+            ),
+            pros=[], cons=[], score=0, confidence=80,
+            products=[], alternatives=[],
+            category=category, intent=intent,
+            amazon_available=True,
+        )
+
     async def stream_recommendation(
         self,
         question: str,
@@ -488,15 +516,22 @@ class RecommendationEngine:
         currency: str = "INR",
         affiliate_tag: str = "whatsay-21",
     ) -> AsyncGenerator[str, None]:
+        """Stream brief intro while full recommendation loads."""
+        if not self._search_available():
+            yield "Live Amazon product search is unavailable. Please configure SerpAPI."
+            return
+
         messages = [
             AIMessage(role="system", content=(
                 "You are WhatSay AI, a friendly Amazon India buying advisor. "
-                "Give a brief 1-2 sentence response saying you're searching Amazon India "
-                "for the best options. Be warm and concise."
+                "Give a brief 1-2 sentence response saying you're searching Amazon India live "
+                "for real products. Be warm and concise."
             )),
             AIMessage(role="user", content=question),
         ]
-        async for chunk in self.ai_provider.stream(messages=messages, max_tokens=60, temperature=0.5):
+        async for chunk in self.ai_provider.stream(
+            messages=messages, max_tokens=60, temperature=0.5
+        ):
             yield chunk
 
     def _parse_json(self, content: str) -> dict:
