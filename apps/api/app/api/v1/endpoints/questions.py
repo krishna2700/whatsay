@@ -135,7 +135,7 @@ async def ask_question_stream(
                 user_id=current_user.id if current_user else None,
                 affiliate_tag=affiliate_tag,
             )
-            q_response = _build_question_response(question)
+            q_response = _build_question_response(question, include_products=True)
             response_data = AskQuestionResponse(
                 question=q_response,
                 recommendation=q_response.recommendation,
