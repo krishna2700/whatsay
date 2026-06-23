@@ -29,32 +29,36 @@ from app.core.config import settings
 router = APIRouter(prefix="/questions", tags=["Questions"])
 
 
-def _build_question_response(question: Question) -> QuestionResponse:
-    """Build QuestionResponse from a Question ORM object with loaded relationships."""
+def _build_question_response(question: Question, include_products: bool = False) -> QuestionResponse:
+    """Build QuestionResponse — only access already-loaded relationships."""
     rec_response = None
     if question.recommendation:
         rec = question.recommendation
-        products = [
-            RecommendedProductResponse(
-                id=p.id,
-                name=p.name,
-                brand=p.brand,
-                category=p.category,
-                price=p.price,
-                currency=p.currency,
-                rating=p.rating,
-                review_count=p.review_count,
-                image_url=p.image_url,
-                amazon_url=p.amazon_url,
-                affiliate_url=p.affiliate_url,
-                asin=p.asin,
-                specs=p.specs or {},
-                why_recommended=p.why_recommended,
-                rank=p.rank,
-                is_alternative=p.is_alternative,
-            )
-            for p in (rec.products or [])
-        ]
+        # Only load products if explicitly requested (detail view)
+        # For list view, skip products to avoid lazy loading
+        products = []
+        if include_products and rec.products:
+            products = [
+                RecommendedProductResponse(
+                    id=p.id,
+                    name=p.name,
+                    brand=p.brand,
+                    category=p.category,
+                    price=p.price,
+                    currency=p.currency,
+                    rating=p.rating,
+                    review_count=p.review_count,
+                    image_url=p.image_url,
+                    amazon_url=p.amazon_url,
+                    affiliate_url=p.affiliate_url,
+                    asin=p.asin,
+                    specs=p.specs or {},
+                    why_recommended=p.why_recommended,
+                    rank=p.rank,
+                    is_alternative=p.is_alternative,
+                )
+                for p in rec.products
+            ]
         rec_response = RecommendationResponse(
             id=rec.id,
             question_id=rec.question_id,
@@ -101,7 +105,8 @@ async def ask_question(
         affiliate_tag=affiliate_tag,
     )
 
-    q_response = _build_question_response(question)
+    # include_products=True for ask — user needs full product cards
+    q_response = _build_question_response(question, include_products=True)
     return AskQuestionResponse(
         question=q_response,
         recommendation=q_response.recommendation,
@@ -155,14 +160,28 @@ async def get_user_questions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedQuestionsResponse:
-    from sqlalchemy import func, desc
-    from app.repositories.question_repository import QuestionRepository
+    from sqlalchemy import func, desc, select, text
+    from app.models.question import Question
+    from sqlalchemy.orm import selectinload
 
-    repo = QuestionRepository(db)
     skip = (page - 1) * per_page
-    questions, total = await repo.get_user_questions(
-        user_id=current_user.id, skip=skip, limit=per_page
+
+    # Count
+    count_result = await db.execute(
+        select(func.count()).select_from(Question).where(Question.user_id == current_user.id)
     )
+    total = count_result.scalar_one()
+
+    # Fetch with eager loaded recommendations
+    result = await db.execute(
+        select(Question)
+        .where(Question.user_id == current_user.id)
+        .options(selectinload(Question.recommendation))
+        .order_by(desc(Question.created_at))
+        .offset(skip)
+        .limit(per_page)
+    )
+    questions = result.scalars().all()
     total_pages = (total + per_page - 1) // per_page
 
     return PaginatedQuestionsResponse(
@@ -192,7 +211,7 @@ async def get_question_by_slug(
 ) -> QuestionResponse:
     service = QuestionService(db)
     question = await service.get_question_by_slug(slug)
-    return _build_question_response(question)
+    return _build_question_response(question, include_products=True)
 
 
 @router.get("/{question_id}", response_model=QuestionResponse)
@@ -202,7 +221,7 @@ async def get_question(
 ) -> QuestionResponse:
     service = QuestionService(db)
     question = await service.get_question(question_id)
-    return _build_question_response(question)
+    return _build_question_response(question, include_products=True)
 
 
 @router.post("/{question_id}/helpful", status_code=status.HTTP_204_NO_CONTENT)
